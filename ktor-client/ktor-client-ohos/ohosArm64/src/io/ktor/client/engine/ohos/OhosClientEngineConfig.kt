@@ -14,8 +14,8 @@ public class OhosClientEngineConfig: HttpClientEngineConfig() {
      * better integration with the platform and avoids potential curl-related issues.
      * 
      * Set to `false` to use curl as a fallback.
-     * 
-     * Default: `true`
+     *
+     * Default: `false`
      */
     public var useRcp: Boolean = false
 
