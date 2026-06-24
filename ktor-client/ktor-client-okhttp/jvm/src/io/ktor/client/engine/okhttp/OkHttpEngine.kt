@@ -105,7 +105,23 @@ public class OkHttpEngine(override val config: OkHttpConfig) : HttpClientEngineB
         )
 
         val originResponse = session.originResponse.await()
-        return buildResponseData(originResponse, requestTime, session, callContext)
+        val contentType = originResponse.header(HttpHeaders.ContentType)
+            ?.let { runCatching { ContentType.parse(it) }.getOrNull() }
+        val isEventStream = originResponse.code == HttpStatusCode.OK.value &&
+            contentType?.withoutParameters() == ContentType.Text.EventStream
+        if (isEventStream) {
+            return buildResponseData(originResponse, requestTime, session, callContext)
+        }
+        // Non-SSE / error response (e.g. a 403 carrying `region_unsupported`). The body was buffered in
+        // OkHttpSSESession.onFailure before OkHttp closed it, so surface it as the response content —
+        // letting callers read the error payload instead of an empty / `Content-Length mismatch` body.
+        // Re-set Content-Length to the actually-delivered size: if onFailure had to cap a huge (>64 KiB)
+        // body, the original header would otherwise overstate the length and trip Ktor's own check.
+        val errorBody = runCatching { originResponse.body?.bytes() }.getOrNull() ?: ByteArray(0)
+        val errorResponse = originResponse.newBuilder()
+            .header(HttpHeaders.ContentLength, errorBody.size.toString())
+            .build()
+        return buildResponseData(errorResponse, requestTime, ByteReadChannel(errorBody), callContext)
     }
 
     private suspend fun executeHttpRequest(

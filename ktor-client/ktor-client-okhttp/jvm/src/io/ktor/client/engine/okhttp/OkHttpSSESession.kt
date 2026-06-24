@@ -49,7 +49,14 @@ internal class OkHttpSSESession(
         if (response != null &&
             (statusCode != HttpStatusCode.OK.value || contentType != ContentType.Text.EventStream.toString())
         ) {
-            originResponse.complete(response)
+            // OkHttp's RealEventSource runs this callback inside `response.use { ... }`, so the body is
+            // closed the moment onFailure returns. Buffer the (small) error payload now via peekBody so
+            // OkHttpEngine can still surface it downstream — otherwise callers read an empty body / hit a
+            // "Content-Length mismatch" and lose the error code (e.g. a 403's `region_unsupported`).
+            val bufferedResponse = runCatching {
+                response.newBuilder().body(response.peekBody(MAX_ERROR_BODY_BYTES)).build()
+            }.getOrDefault(response)
+            originResponse.complete(bufferedResponse)
         } else {
             val error = t?.let {
                 SSEClientException(
@@ -87,5 +94,10 @@ internal class OkHttpSSESession(
 
             else -> unexpectedError()
         }
+    }
+
+    private companion object {
+        // An error on an SSE stream is a tiny status payload; cap the buffered copy defensively.
+        const val MAX_ERROR_BODY_BYTES = 64L * 1024
     }
 }
