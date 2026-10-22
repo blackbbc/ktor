@@ -48,19 +48,22 @@ internal class CurlProcessor(coroutineContext: CoroutineContext) {
         return result.await()
     }
 
-    @OptIn(DelicateCoroutinesApi::class)
+    @OptIn(DelicateCoroutinesApi::class, ExperimentalForeignApi::class)
     private fun runEventLoop() {
         curlScope.launch {
-            val api = curlApi!!
-            
-            while (!requestQueue.isClosedForReceive) {
-                try {
-                    drainRequestQueue(api)
-                    api.perform()
-                } catch (e: kotlinx.coroutines.CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    // Continue event loop on error
+            memScoped {
+                val transfersRunning = alloc<IntVar>()
+                val api = curlApi!!
+
+                while (!requestQueue.isClosedForReceive) {
+                    try {
+                        drainRequestQueue(api)
+                        api.perform(transfersRunning)
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        // Continue event loop on error
+                    }
                 }
             }
         }
@@ -75,15 +78,17 @@ internal class CurlProcessor(coroutineContext: CoroutineContext) {
                 requestQueue.receiveCatching()
             }.getOrNull() ?: break
 
-            val requestHandler = api.scheduleRequest(container.requestData, container.completionHandler)
-
-            val requestCleaner = container.requestData.executionContext.invokeOnCompletion { cause ->
-                if (cause == null) return@invokeOnCompletion
-                cancelRequest(requestHandler, cause)
+            // Watched until the native transfer is released, not just until the response starts: a streamed
+            // body (SSE) keeps its transfer long after that, and cancelling the call must still remove it.
+            // Release happens on this thread in a later perform(), so the handle is always set by then.
+            var requestCleaner: DisposableHandle? = null
+            val requestHandler = api.scheduleRequest(container.requestData, container.completionHandler) {
+                requestCleaner?.dispose()
             }
 
-            container.completionHandler.invokeOnCompletion {
-                requestCleaner.dispose()
+            requestCleaner = container.requestData.executionContext.invokeOnCompletion { cause ->
+                if (cause == null) return@invokeOnCompletion
+                cancelRequest(requestHandler, container.completionHandler, cause)
             }
         }
     }
@@ -101,10 +106,9 @@ internal class CurlProcessor(coroutineContext: CoroutineContext) {
         }
     }
 
+    /** Straight to the handler, not through [curlScope]: the event loop never yields while transfers run. */
     @OptIn(ExperimentalForeignApi::class)
-    private fun cancelRequest(easyHandle: EasyHandle, cause: Throwable) {
-        curlScope.launch {
-            curlApi!!.cancelRequest(easyHandle, cause)
-        }
+    private fun cancelRequest(easyHandle: EasyHandle, owner: CompletableDeferred<CurlSuccess>, cause: Throwable) {
+        curlApi!!.cancelRequest(easyHandle, owner, cause)
     }
 }

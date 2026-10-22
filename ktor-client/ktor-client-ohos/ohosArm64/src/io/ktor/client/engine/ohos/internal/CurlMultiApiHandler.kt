@@ -17,11 +17,14 @@ private class RequestHolder @OptIn(ExperimentalForeignApi::class) constructor(
     val responseCompletable: CompletableDeferred<CurlSuccess>,
     val requestWrapper: StableRef<CurlRequestBodyData>,
     val responseWrapper: StableRef<CurlResponseBodyData>,
+    /** The native transfer is gone: whoever watches the request for cancellation can stop. */
+    val onReleased: () -> Unit,
 ) {
     @OptIn(ExperimentalForeignApi::class)
     fun dispose() {
         requestWrapper.dispose()
         responseWrapper.dispose()
+        onReleased()
     }
 }
 
@@ -30,8 +33,18 @@ internal class CurlMultiApiHandler : Closeable {
     @OptIn(ExperimentalForeignApi::class)
     private val activeHandles = mutableMapOf<EasyHandle, RequestHolder>()
 
+    /** [owner] tells the request apart from a later one whose easy handle reuses the same address. */
     @OptIn(ExperimentalForeignApi::class)
-    private val cancelledHandles = mutableSetOf<Pair<EasyHandle, Throwable>>()
+    private class Cancellation(
+        val easyHandle: EasyHandle,
+        val owner: CompletableDeferred<CurlSuccess>,
+        val cause: Throwable,
+    )
+
+    /** Guards [pendingCancellations] and [closed]: cancellations arrive from any thread. */
+    private val cancellationsLock = SynchronizedObject()
+    private val pendingCancellations = mutableListOf<Cancellation>()
+    private var closed = false
 
     @OptIn(ExperimentalForeignApi::class)
     private val multiHandle: MultiHandle = curl_multi_init()
@@ -44,6 +57,11 @@ internal class CurlMultiApiHandler : Closeable {
 
     @OptIn(ExperimentalForeignApi::class)
     override fun close() {
+        // No wakeup may reach the multi handle once it is cleaned up below.
+        synchronized(cancellationsLock) {
+            closed = true
+            pendingCancellations.clear()
+        }
         for ((handle, holder) in activeHandles) {
             cleanupEasyHandle(handle)
             holder.dispose()
@@ -54,7 +72,11 @@ internal class CurlMultiApiHandler : Closeable {
     }
 
     @OptIn(ExperimentalForeignApi::class)
-    fun scheduleRequest(request: CurlRequestData, deferred: CompletableDeferred<CurlSuccess>): EasyHandle {
+    fun scheduleRequest(
+        request: CurlRequestData,
+        deferred: CompletableDeferred<CurlSuccess>,
+        onReleased: () -> Unit,
+    ): EasyHandle {
         val easyHandle = curl_easy_init()
             ?: error("Could not initialize an easy handle")
 
@@ -84,7 +106,8 @@ internal class CurlMultiApiHandler : Closeable {
         val requestHolder = RequestHolder(
             deferred,
             requestWrapper.asStableRef(),
-            responseWrapper.asStableRef()
+            responseWrapper.asStableRef(),
+            onReleased,
         )
 
         activeHandles[easyHandle] = requestHolder
@@ -127,33 +150,58 @@ internal class CurlMultiApiHandler : Closeable {
         return easyHandle
     }
 
+    /**
+     * Thread-safe. The event loop never suspends while transfers are active, so a cancellation dispatched
+     * to its thread would wait until every transfer finished; it is recorded here instead and the poll is
+     * woken, so the next [perform] removes the transfer.
+     */
     @OptIn(ExperimentalForeignApi::class)
-    internal fun cancelRequest(easyHandle: EasyHandle, cause: Throwable) {
-        cancelledHandles += Pair(easyHandle, cause)
+    internal fun cancelRequest(easyHandle: EasyHandle, owner: CompletableDeferred<CurlSuccess>, cause: Throwable) {
+        synchronized(cancellationsLock) {
+            if (closed) return
+            pendingCancellations += Cancellation(easyHandle, owner, cause)
+            curl_multi_wakeup(multiHandle)
+        }
     }
 
+    private fun hasPendingCancellations(): Boolean = synchronized(cancellationsLock) { pendingCancellations.isNotEmpty() }
+
+    /**
+     * One round of the multi handle: perform, collect what finished, wait for activity, then return to
+     * the event loop so it can schedule requests queued meanwhile.
+     *
+     * It used to loop until every transfer had finished, so a long-lived one (an SSE stream) kept every
+     * request enqueued after it waiting in the queue until the stream closed. Backport of upstream
+     * KTOR-8259 (ktorio/ktor@f6a545d89, 3.2.0). A queued request breaks the poll via [wakeup].
+     *
+     * Unlike upstream, finished transfers are collected before the poll: a response that completed in
+     * this round would otherwise only see its body closed once the poll returned, up to its whole timeout
+     * when the only other transfer is a quiet SSE stream.
+     */
     @OptIn(ExperimentalForeignApi::class)
-    internal fun perform() {
+    internal fun perform(transfersRunning: IntVarOf<Int>) {
         if (activeHandles.isEmpty()) return
 
-        memScoped {
-            val transfersRunning = alloc<IntVar>()
-            do {
-                synchronized(easyHandlesToUnpauseLock) {
-                    var handle = easyHandlesToUnpause.removeFirstOrNull()
-                    while (handle != null) {
-                        curl_easy_pause(handle, CURLPAUSE_CONT)
-                        handle = easyHandlesToUnpause.removeFirstOrNull()
-                    }
-                }
-                curl_multi_perform(multiHandle, transfersRunning.ptr).verify()
-                if (transfersRunning.value != 0) {
-                    curl_multi_poll(multiHandle, null, 0.toUInt(), 10000, null).verify()
-                }
-                if (transfersRunning.value < activeHandles.size) {
-                    handleCompleted()
-                }
-            } while (transfersRunning.value != 0)
+        // Process cancelled handles before performing so they don't hold up curl_multi_poll.
+        if (hasPendingCancellations()) {
+            handleCompleted()
+        }
+
+        if (activeHandles.isEmpty()) return
+
+        synchronized(easyHandlesToUnpauseLock) {
+            var handle = easyHandlesToUnpause.removeFirstOrNull()
+            while (handle != null) {
+                if (handle in activeHandles) curl_easy_pause(handle, CURLPAUSE_CONT)
+                handle = easyHandlesToUnpause.removeFirstOrNull()
+            }
+        }
+        curl_multi_perform(multiHandle, transfersRunning.ptr).verify()
+        if (transfersRunning.value < activeHandles.size) {
+            handleCompleted()
+        }
+        if (transfersRunning.value != 0) {
+            curl_multi_poll(multiHandle, null, 0.toUInt(), 10000, null).verify()
         }
     }
 
@@ -208,23 +256,25 @@ internal class CurlMultiApiHandler : Closeable {
     @OptIn(ExperimentalForeignApi::class)
     private fun handleCompleted() {
         // Process cancelled handles with safety guarantees
-        try {
-            for (cancellation in cancelledHandles) {
-                val easyHandle = cancellation.first
-                val cause = cancellation.second
-                
-                val handler = activeHandles.remove(easyHandle) ?: continue
-                
-                try {
-                    val cancelled = processCancelledEasyHandle(easyHandle, cause, handler)
-                    handler.responseCompletable.completeExceptionally(cancelled.cause)
-                    handler.dispose()
-                } catch (e: Exception) {
-                    // Continue processing other handles
-                }
+        val cancellations = synchronized(cancellationsLock) {
+            pendingCancellations.toList().also { pendingCancellations.clear() }
+        }
+        for (cancellation in cancellations) {
+            val easyHandle = cancellation.easyHandle
+            val cause = cancellation.cause
+
+            // Finished already, or the address now belongs to a newer request: nothing to cancel.
+            if (activeHandles[easyHandle]?.responseCompletable !== cancellation.owner) continue
+            val handler = activeHandles.remove(easyHandle) ?: continue
+
+            try {
+                val cancelled = processCancelledEasyHandle(easyHandle, cause, handler)
+                handler.responseCompletable.completeExceptionally(cancelled.cause)
+            } catch (e: Exception) {
+                // Continue processing other handles
+            } finally {
+                handler.dispose()
             }
-        } finally {
-            cancelledHandles.clear()
         }
 
         memScoped {
